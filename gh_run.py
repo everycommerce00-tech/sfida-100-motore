@@ -16,6 +16,11 @@ while True:
         n = sync.apply_cmds(S)
         ev0 = os.path.getsize(e.EVENTS) if os.path.exists(e.EVENTS) else 0
         e.cmd_tick(None)
+        S = e.load()
+        if e.auto_session(S):          # strategia automatica testata: decide da sola, una volta l'ora
+            e.save(S)
+        else:
+            e.save(S)
         ev1 = os.path.getsize(e.EVENTS) if os.path.exists(e.EVENTS) else 0
         S = e.load()
         now = dt.datetime.now(dt.timezone.utc)

@@ -493,6 +493,86 @@ def log_equity(S, ts, px):
     append_csv(EQUITY, ["ts_utc", "cassa", "non_realizzato", "equity", "btc", "vita"],
                [iso(ts), round(S["cash"], 2), round(u, 2), round(S["cash"] + u, 2), px, S["life_no"]])
 
+
+# ---------------------------------------------------------------- strategia automatica (testata)
+AUTO_INSTS = ["BTC", "ETH", "SOL", "DOGE", "XRP", "HYPE", "SUI", "PEPE", "WIF", "BNB"]
+
+def _ema_np(x, n):
+    a = 2 / (n + 1); o = [x[0]]
+    for v in x[1:]:
+        o.append(a * v + (1 - a) * o[-1])
+    return o
+
+def auto_session(S):
+    """Breakout del range asiatico (00-07 UTC) a favore del trend lungo (EMA800 su 1h), 07-20 UTC.
+    Ingresso limit sul ritorno al bordo del range, stop max(0,7 ATR, 0,4%), obiettivo 1R, chiusura entro le 23 UTC.
+    Testata su 12 mesi OKX (10 perp): +0,05R passato, +0,07R su 4 mesi mai visti; tutte le impostazioni vicine positive in verifica."""
+    cfg = S["cfg"]
+    if not cfg.get("auto_session", True):
+        return 0
+    now = dt.datetime.now(UTC)
+    hour_key = now.strftime("%Y-%m-%d %H")
+    if S.get("_auto_h") == hour_key or not (8 <= now.hour <= 20):
+        return 0
+    S["_auto_h"] = hour_key
+    ms_now = now_ms()
+    for m, lab in MACRO_MS:   # niente ingressi da 2h prima a 1h dopo un dato macro
+        if m - 2 * 3600000 <= ms_now <= m + 3600000:
+            return 0
+    today = now.strftime("%Y-%m-%d")
+    done = S.setdefault("_auto_done", {})
+    n = 0
+    for name in AUTO_INSTS:
+        inst = f"{name}-USDT-SWAP"
+        if done.get(name) == today:
+            continue
+        if any(inst_of(p) == inst for p in S["positions"]) or any(inst_of(o) == inst and o["status"] == "pending" for o in S["orders"]):
+            continue
+        rows = []
+        after = None
+        while len(rows) < 1000:
+            p = {"instId": inst, "bar": "1H", "limit": "100"}
+            if after: p["after"] = after
+            r = okx("/market/history-candles" if after else "/market/candles", p)
+            if not r: break
+            rows += [x for x in r if x[8] == "1"]; after = r[-1][0]
+        rows = sorted(rows, key=lambda x: int(x[0]))
+        if len(rows) < 850:
+            continue
+        t = [int(x[0]) for x in rows]; h = [float(x[2]) for x in rows]; l = [float(x[3]) for x in rows]; c = [float(x[4]) for x in rows]
+        e800 = _ema_np(c, 800)
+        tr = [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+        atr = _ema_np(tr, 14)[-1]
+        day0 = int(dt.datetime.strptime(today, "%Y-%m-%d").replace(tzinfo=UTC).timestamp() * 1000)
+        asia = [i for i in range(len(t)) if day0 <= t[i] < day0 + 7 * 3600000]
+        if len(asia) < 6:
+            continue
+        rh = max(h[i] for i in asia); rl = min(l[i] for i in asia)
+        last = len(c) - 1   # ultima candela 1h chiusa
+        side = 1 if (c[last] > rh and c[last] > e800[last]) else (-1 if (c[last] < rl and c[last] < e800[last]) else 0)
+        if not side:
+            continue
+        price = rh if side == 1 else rl
+        dist = max(0.7 * atr, price * 0.004)
+        stop = price - side * dist
+        tp = price + side * dist
+        risk_pct = cfg.get("auto_risk", 0.10)
+        per = dist + price * (cfg["fee_maker"] + cfg["fee_taker"] + cfg["slip_stop"])
+        qty = risk_pct * S["cash"] / per
+        lev = max(5, min(30, int(qty * price / (S["cash"] * 0.25)) + 1))   # margine ~25% del conto per trade
+        end23 = day0 + 23 * 3600000
+        oid = S["next_id"]; S["next_id"] += 1
+        S["orders"].append(dict(id=oid, inst=inst, ref_px=price, status="pending",
+                                setup="Auto · breakout sessione asiatica", reason=f"rottura range 00-07 UTC ({it(rl, 1)}–{it(rh, 1)}) a favore del trend",
+                                side="long" if side == 1 else "short", type="limit", price=price, qty=qty, lev=lev, stop=stop,
+                                tp1=tp, tp2=None, tp1_frac=1.0, shadow=False, active_from=(ms_now // 60000 + 1) * 60000,
+                                expire_ms=ms_now + 3 * 3600000, max_hold_ms=max(3600000, end23 - ms_now)))
+        done[name] = today
+        n += 1
+        event(S, ms_now, "ORDINE_AUTO", f"🤖 Strategia automatica: ordine {'LONG' if side == 1 else 'SHORT'} su {name} a {it(price, 1)} "
+              f"(ritorno sul bordo del range asiatico) · stop {it(stop, 0)} · obiettivo {it(tp, 0)} · rischio {risk_pct * 100:.0f}% del conto · valido 3 ore", notify=True)
+    return n
+
 # ---------------------------------------------------------------- comandi
 def cmd_init(a):
     if os.path.exists(STATE) and not a.force:
@@ -795,6 +875,7 @@ def main():
     sp.add_parser("status").set_defaults(f=cmd_status)
     sp.add_parser("report").set_defaults(f=cmd_report)
     sp.add_parser("daily").set_defaults(f=cmd_daily)
+    au = sp.add_parser("auto"); au.set_defaults(f=lambda a: (lambda S: (print(auto_session(S)), save(S)))(load()))
     a = ap.parse_args()
     a.f(a)
 
