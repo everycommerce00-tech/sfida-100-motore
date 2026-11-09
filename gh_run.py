@@ -18,10 +18,15 @@ while True:
         e.cmd_tick(None)
         ev1 = os.path.getsize(e.EVENTS) if os.path.exists(e.EVENTS) else 0
         S = e.load()
-        h = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H")
-        if S.get("_last_report_h") != h:
-            e.cmd_report(None)
-            S = e.load(); S["_last_report_h"] = h; e.save(S)
+        now = dt.datetime.now(dt.timezone.utc)
+        h = now.strftime("%Y-%m-%d %H")
+        n_ev = sum(1 for _ in open(e.EVENTS, encoding="utf-8")) if os.path.exists(e.EVENTS) else 0
+        if now.hour == 20 and S.get("_last_daily") != now.strftime("%Y-%m-%d"):
+            e.cmd_daily(None)                                   # riepilogo del giorno alle 21 italiane
+            S = e.load(); S["_last_daily"] = now.strftime("%Y-%m-%d"); S["_last_report_h"] = h; S["_ev_at_report"] = n_ev; e.save(S)
+        elif S.get("_last_report_h") != h and (n_ev != S.get("_ev_at_report") or now.hour % 4 == 0):
+            e.cmd_report(None)                                  # aggiornamento solo se è successo qualcosa (o ogni 4 ore)
+            S = e.load(); S["_last_report_h"] = h; S["_ev_at_report"] = n_ev; e.save(S)
         if n or ev1 != ev0 or time.time() - last_push > 600:
             sync.push_state(); last_push = time.time()
     except Exception as ex:

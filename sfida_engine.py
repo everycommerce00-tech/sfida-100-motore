@@ -316,14 +316,17 @@ def open_pos(S, o, c, px, maker, funding):
         S["first_trade_done"] = True
     cash_add(S, ts, -fee, "FEE", f"entrata #{o['id']}", shadow)
     S["fills"].append({"ts": ts, "side": "sell" if short else "buy", "px": px, "id": o["id"], "kind": "ENTRY", "inst": inst_of(o)})
-    risk = abs(px - o["stop"]) * o["qty"]
+    cfgf = S["cfg"]
+    risk = (abs(px - o["stop"]) + px * cfgf["fee_taker"] + o["stop"] * (cfgf["fee_taker"] + cfgf["slip_stop"])) * o["qty"]
     tag = "👻 (ombra) " if shadow else ""
+    gain = abs(o["tp1"] - px) * o["qty"] if o.get("tp1") else None
     event(S, ts, "ENTRATA",
-          f"{'🔴' if short else '🟢'} {tag}INGRESSO #{o['id']} — {o['side'].upper()} {short_name(inst_of(o))} @ {it(px, 1)} "
-          f"({'limit' if maker else 'mercato'}) · {rome_s(ts)}\nSetup: {o['setup']} · leva {o['lev']}x isolata\n"
-          f"Rischio ${it(risk)} · stop {it(o['stop'], 0)}"
-          + (f" · TP1 {it(o['tp1'], 0)}" if o.get("tp1") else "") + (f" · TP2 {it(o['tp2'], 0)}" if o.get("tp2") else "")
-          + f"\nCapitale: ${it(S['cash'])}", notify=not shadow)
+          f"{'🔴' if short else '🟢'} {tag}APERTO {'SHORT (scommessa al ribasso)' if short else 'LONG (scommessa al rialzo)'} su {short_name(inst_of(o))} · #{o['id']}\n"
+          f"Rischio massimo: −${it(risk)} ({it(risk / max(S['cash'], 1e-9) * 100, 1)}% del conto)"
+          + (f" · obiettivo: +${it(gain)}" if gain else "") + "\n"
+          f"Entrata {it(px, 1)} · stop {it(o['stop'], 0)}"
+          + (f" · obiettivo {it(o['tp1'], 0)}" if o.get("tp1") else "") + (f" / {it(o['tp2'], 0)}" if o.get("tp2") else "")
+          + f"\nIdea: {o['setup']} · leva {o['lev']}x · {rome_s(ts)}", notify=not shadow)
     return pos
 
 def close_part(S, p, c, px, q, reason, maker):
@@ -336,10 +339,12 @@ def close_part(S, p, c, px, q, reason, maker):
     p["exits"].append({"ts": ts, "px": px, "qty": q, "reason": reason})
     cash_add(S, ts, gross - fee, "PNL", f"{reason} #{p['id']}", p["shadow"])
     S["fills"].append({"ts": ts, "side": "buy" if short else "sell", "px": px, "id": p["id"], "kind": reason, "inst": inst_of(p)})
-    emoji = {"USCITA_TEMPO": "⏱️", "TP1": "✅", "TP2": "🎯", "STOP": "🛑", "LIQUIDAZIONE": "💥", "VITA_PERSA": "☠️"}.get(reason, "•")
+    p["last_reason"] = reason
     tag = "👻 (ombra) " if p["shadow"] else ""
-    event(S, ts, reason, f"{emoji} {tag}{reason} #{p['id']} — chiuso {it(q, 4)} {short_name(inst_of(p))} @ {it(px, 1)} · "
-          f"{'+' if gross - fee >= 0 else '−'}${it(abs(gross - fee))} · {rome_s(ts)}", notify=not p["shadow"])
+    if p["qty_open"] > 1e-9:
+        event(S, ts, reason, f"✅ {tag}{short_name(inst_of(p))} #{p['id']}: primo obiettivo preso, incassati "
+              f"{'+' if gross - fee >= 0 else '−'}${it(abs(gross - fee))}. Il resto resta aperto con lo stop all'entrata (rischio zero).",
+              notify=not p["shadow"])
     if p["qty_open"] <= 1e-9:
         finalize(S, p, ts, reason)
 
@@ -366,9 +371,13 @@ def finalize(S, p, ts, reason):
     S["closed"] = S.get("closed", 0) + (0 if p["shadow"] else 1)
     h, m = int(hold // 60), int(hold % 60)
     tag = "👻 (ombra) " if p["shadow"] else ""
+    why = {"TP1": "obiettivo raggiunto 🎯", "TP2": "obiettivo finale raggiunto 🎯", "STOP": "stop toccato 🛑",
+           "USCITA_TEMPO": "tempo massimo scaduto ⏱️", "LIQUIDAZIONE": "LIQUIDAZIONE 💥", "VITA_PERSA": "vita persa ☠️"}.get(reason, reason)
+    ret = (S["cash"] / S["cfg"]["start_capital"] - 1) * 100
     event(S, ts, "TRADE_CHIUSO",
-          f"📊 {tag}TRADE #{p['id']} CHIUSO: {'+' if net >= 0 else '−'}${it(abs(net))} netti "
-          f"({it(net / risk_usd, 2) + 'R' if risk_usd else ''}) · durata {h}h {m}m · capitale ${it(S['cash'])}", notify=not p["shadow"])
+          f"{'✅' if net >= 0 else '❌'} {tag}CHIUSO {short_name(inst_of(p))} #{p['id']}: {why}\n"
+          f"Risultato: {'+' if net >= 0 else '−'}${it(abs(net))} (commissioni e funding inclusi) · durata {h}h {m}m\n"
+          f"Capitale: ${it(S['cash'])} ({'+' if ret >= 0 else ''}{it(ret, 1)}% dall'inizio)", notify=not p["shadow"])
 
 def manage(S, p, c, entry_candle=False):
     ts, op, h, l, cl = c
@@ -657,73 +666,122 @@ def cmd_modify(a):
 def cmd_status(a):
     print(status_text(load()))
 
-def cmd_report(a):
+def _equity_rows():
+    if not os.path.exists(EQUITY):
+        return []
+    return [r for r in csv.DictReader(open(EQUITY, encoding="utf-8"))]
+
+def perf_vs_btc(S):
+    """Rendimento % del conto e di BTC (comprato e tenuto) dall'inizio della sfida."""
+    rows = _equity_rows()
+    btc0 = float(rows[0]["btc"]) if rows else None
+    btc_now = last_price()
+    eq = S["cash"] + unreal(S)
+    p = (eq / S["cfg"]["start_capital"] - 1) * 100
+    b = (btc_now / btc0 - 1) * 100 if btc0 else 0.0
+    t0 = tsms("2026-11-08 21:33")
+    target = (10 ** (((now_ms() - t0) / 86400000) / 21) - 1) * 100
+    return p, b, target, eq
+
+def f1(x):
+    return f"{x:.1f}".replace(".", ",")
+
+def sg(x):
+    return ("+" if x >= 0 else "−") + f1(abs(x)) + "%"
+
+def cmd_report(a, daily=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     S = load()
     T = lambda ms: dt.datetime.fromtimestamp(ms / 1000, UTC).astimezone(ROME)
-    t0 = tsms("2026-11-08 21:00")
-    insts = [INST]
-    for x in S["fills"]:
-        i = x.get("inst", INST)
-        if i not in insts:
-            insts.append(i)
-    for x in S["positions"] + [o for o in S["orders"] if o["status"] == "pending"]:
+    t0 = tsms("2026-11-08 21:33")
+    # mercati da mostrare: SOLO posizioni aperte e ordini in attesa
+    live = [("pos", p) for p in S["positions"] if not p["shadow"]] + \
+           [("ord", o) for o in S["orders"] if o["status"] == "pending" and not o.get("shadow")]
+    insts = []
+    for _, x in live:
         if inst_of(x) not in insts:
             insts.append(inst_of(x))
-    eq = []
-    if os.path.exists(EQUITY):
-        eq = [(T(tsms(r["ts_utc"])), float(r["equity"])) for r in csv.DictReader(open(EQUITY, encoding="utf-8"))]
     n = 1 + len(insts)
-    fig, axes = plt.subplots(n, 1, sharex=True, figsize=(11, 3 + 2.6 * n),
-                             gridspec_kw={"height_ratios": [1.3] + [1] * len(insts)})
-    ax0 = axes[0]
-    if eq:
-        ax0.plot([x[0] for x in eq], [x[1] for x in eq], color="#1565c0", lw=2)
-        ax0.axhline(S["cfg"]["start_capital"], color="#999", ls="--", lw=1)
-    ax0.set_title(f"Equity della sfida — ${S['cash']:.2f} (vita {S['life_no']}/{S['cfg']['max_lives']})")
-    span_ms = max(now_ms() - t0, 3.6e6)
-    bar = "5m" if span_ms < 1.2e8 else "15m" if span_ms < 3.6e8 else "1H"
+    fig, axes = plt.subplots(n, 1, figsize=(10, 3.4 + 2.6 * len(insts)), squeeze=False,
+                             gridspec_kw={"height_ratios": [1.4] + [1] * len(insts)})
+    axes = [x[0] for x in axes]
+    # pannello 1: conto vs BTC vs obiettivo, in %
+    rows = _equity_rows()
+    if rows:
+        rows = [{"ts_utc": "2026-11-08 21:33", "equity": S["cfg"]["start_capital"], "btc": rows[0]["btc"]}] + rows
+        tt = [T(tsms(r["ts_utc"])) for r in rows]
+        btc0 = float(rows[0]["btc"])
+        pe = [(float(r["equity"]) / S["cfg"]["start_capital"] - 1) * 100 for r in rows]
+        pb = [(float(r["btc"]) / btc0 - 1) * 100 for r in rows]
+        po = [(10 ** (((tsms(r["ts_utc"]) - t0) / 86400000) / 21) - 1) * 100 for r in rows]
+        ax = axes[0]
+        ax.plot(tt, pe, color="#1565c0", lw=2.2, label=f"Sfida {pe[-1]:+.1f}%")
+        ax.plot(tt, pb, color="#f7931a", lw=1.6, label=f"BTC tenuto {pb[-1]:+.1f}%")
+        ax.plot(tt, po, color="#2e7d32", lw=1.2, ls="--", label=f"Percorso per ×10 {po[-1]:+.1f}%")
+        ax.axhline(0, color="#999", lw=0.8)
+        ax.set_ylabel("% dall'inizio")
+        ax.legend(loc="upper left", fontsize=8)
+        ax.set_title("La sfida contro BTC e contro l'obiettivo")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %H:%M", tz=ROME))
+    # un pannello per ogni mercato con posizione o ordine attivo
     for ax, i in zip(axes[1:], insts):
-        rows = []
-        after = None
-        while True:
-            p = {"instId": i, "bar": bar, "limit": "100"}
-            if after: p["after"] = after
-            r = okx("/market/history-candles" if after else "/market/candles", p)
-            if not r: break
-            rows += r
-            after = r[-1][0]
-            if int(after) <= t0 or len(rows) > 1500: break
-        rows = sorted([r for r in rows if int(r[0]) >= t0], key=lambda r: int(r[0]))
-        ax.plot([T(int(r[0])) for r in rows], [float(r[4]) for r in rows], color="#222", lw=1)
-        ax.set_title(f"{short_name(i)} ({bar})")
-        for p in S["positions"]:
-            if inst_of(p) == i:
-                ax.axhline(p["stop"], color="red", ls=":", lw=1)
-                if p.get("tp1"): ax.axhline(p["tp1"], color="green", ls=":", lw=1)
-                ax.axhline(p["entry_px"], color="#1565c0", ls=":", lw=1)
-        for o in S["orders"]:
-            if o["status"] == "pending" and inst_of(o) == i and o.get("price"):
-                ax.axhline(o["price"], color="orange", ls="--", lw=1)
-    for f in S["fills"]:
-        col = "green" if f["side"] == "buy" else "red"
-        for ax in axes:
-            ax.axvline(T(f["ts"]), color=col, alpha=0.8, lw=1.4)
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%d/%m %H:%M", tz=ROME))
-    fig.autofmt_xdate()
+        r = okx("/market/candles", {"instId": i, "bar": "15m", "limit": "64"})[::-1]
+        ax.plot([T(int(x[0])) for x in r], [float(x[4]) for x in r], color="#222", lw=1)
+        lab = []
+        for kind, x in live:
+            if inst_of(x) != i:
+                continue
+            if kind == "pos":
+                ax.axhline(x["entry_px"], color="#1565c0", ls=":", lw=1.2)
+                ax.axhline(x["stop"], color="red", ls="--", lw=1)
+                if x.get("tp1"): ax.axhline(x["tp1"], color="green", ls="--", lw=1)
+                if x.get("tp2"): ax.axhline(x["tp2"], color="green", ls=":", lw=1)
+                ax.axvline(T(x["entry_ts"]), color="green" if x["side"] == "long" else "red", lw=1.4, alpha=0.8)
+                px = float(r[-1][4])
+                pl = ((x["entry_px"] - px) if x["side"] == "short" else (px - x["entry_px"])) * x["qty_open"]
+                lab.append(f"#{x['id']} {x['side']} {pl:+.2f}$")
+            else:
+                ax.axhline(x["price"] or 0, color="orange", ls="--", lw=1.2)
+                lab.append(f"ordine #{x['id']} {x['side']} @ {it(x['price'] or 0, 1)}")
+        ax.set_title(f"{short_name(i)} (15m) — " + " · ".join(lab), fontsize=9)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=ROME))
     fig.tight_layout()
     fig.savefig(P("report.png"), dpi=110)
+    plt.close(fig)
+    p, b, target, eq = perf_vs_btc(S)
     closed = list(csv.DictReader(open(TRADES, encoding="utf-8"))) if os.path.exists(TRADES) else []
     real = [r for r in closed if r["ombra"] == "0"]
-    wins = sum(1 for r in real if float(r["netto"]) > 0)
-    txt = ("📈 RIEPILOGO SFIDA $100\n" + status_text(S) +
-           f"\nTrade chiusi: {len(real)} (vinti {wins}) · netto totale ${sum(float(r['netto']) for r in real):+.2f}"
-           "\nLinee verdi = acquisti, rosse = vendite · arancio = ordini in attesa · puntinate = entrata/stop/TP")
+    today = dt.datetime.now(UTC).strftime("%Y-%m-%d")
+    td = [r for r in real if r["uscita_utc"].startswith(today)]
+    lines = [("📅 RIEPILOGO DEL GIORNO" if daily else "📈 AGGIORNAMENTO") + " — SFIDA $100",
+             f"Conto: ${it(eq)} ({sg(p)}) · BTC tenuto: {sg(b)} · {'meglio' if p >= b else 'peggio'} di BTC di {f1(abs(p - b))} punti",
+             f"Obiettivo ×10: oggi dovrei essere a {sg(target)} → {'avanti' if p >= target else 'indietro'} di {f1(abs(p - target))} punti",
+             f"Vita {S['life_no']}/{S['cfg']['max_lives']} · giorno {S['day_no']} di 21"]
+    if td:
+        lines.append(f"Oggi: {len(td)} trade chiusi, {sum(1 for r in td if float(r['netto']) > 0)} vinti, "
+                     f"{'+' if sum(float(r['netto']) for r in td) >= 0 else '−'}${it(abs(sum(float(r['netto']) for r in td)))}")
+    if daily and real:
+        by = {}
+        for r in real:
+            import re
+            k = re.sub(r" [A-Z]+/[A-Z]+", "", r["setup"].split("(")[0]).replace("Forza relativa", "Coppia forza relativa").strip()
+            v = by.setdefault(k, [0, 0, 0.0]); v[0] += 1; v[1] += float(r["netto"]) > 0; v[2] += float(r["netto"])
+        lines.append("Per tipo di idea (trade · vinti · netto):")
+        for k, v in sorted(by.items(), key=lambda kv: kv[1][2]):
+            lines.append(f"  {k}: {v[0]} · {v[1]} · {'+' if v[2] >= 0 else '−'}${it(abs(v[2]))}")
+        fees = sum(float(r["fee"]) for r in real)
+        lines.append(f"Commissioni pagate finora: ${it(fees)}")
+    if not live:
+        lines.append("Nessuna posizione aperta né ordine in attesa.")
+    txt = "\n".join(lines)
     send(txt, photo=P("report.png"), button=True)
     print(txt)
+
+def cmd_daily(a):
+    cmd_report(a, daily=True)
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -736,6 +794,7 @@ def main():
     mo.add_argument("--tp1", type=float); mo.add_argument("--tp2", type=float); mo.set_defaults(f=cmd_modify)
     sp.add_parser("status").set_defaults(f=cmd_status)
     sp.add_parser("report").set_defaults(f=cmd_report)
+    sp.add_parser("daily").set_defaults(f=cmd_daily)
     a = ap.parse_args()
     a.f(a)
 
