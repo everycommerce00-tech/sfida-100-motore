@@ -9,7 +9,7 @@ concurrency:
 jobs:
   giro:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 58
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: "-5364252201"
