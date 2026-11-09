@@ -64,7 +64,7 @@ MACRO_MS = [(tsms(a), b) for a, b in MACRO]
 def it(x, d=2):
     if d < 2 and x and 1 <= abs(x) < 100:
         d = 4
-    if x and abs(x) < 1:
+    if d < 2 and x and abs(x) < 1:
         s = f"{x:.{max(d, 4 - int(math.floor(math.log10(abs(x)))))}f}"
         return s.replace(".", ",")
     s = f"{x:,.{d}f}"
